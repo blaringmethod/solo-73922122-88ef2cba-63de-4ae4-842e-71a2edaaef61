@@ -1,0 +1,12 @@
+{
+  "questions": [
+    {"question_id": "q1"},
+    {"question_id": "q2"},
+    {"question_id": "q3", "trigger": [[{"question_id": "q1", "answer": true}]]},
+    {"question_id": "q4", "trigger": [
+      [{"question_id": "q2", "answer": true}],
+      [{"question_id": "q3", "answer": false}]
+    ]},
+    {"question_id": "q5", "trigger": [[{"question_id": "q4", "answer": true}]]}
+  ]
+}

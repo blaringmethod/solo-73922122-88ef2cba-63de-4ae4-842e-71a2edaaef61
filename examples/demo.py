@@ -8,7 +8,9 @@
   1. 可行场景（目标行含线性冗余：四个地区之和 = 三个年龄段之和），
      轮询到成功，校验 0.5d<=w<=2d 与合计误差 <=1e-6；
   2. 冲突场景，返回最小冲突目标子集（删去任一项即可行）；
-  3. 输入修改后旧作业 404、/result 返回 409，证明旧结果永久失效。
+  3. 输入修改后旧作业 404、/result 返回 409，证明旧结果永久失效；
+  4. 问卷质控：按版本号提交跳题问卷与部分答卷，逐份标记漏答/应跳/待复核/
+     矛盾，并演示版本过期返回 409。
 """
 
 from __future__ import annotations
@@ -114,6 +116,45 @@ def main() -> None:
     status, _ = call("GET", "/result")
     print("GET /result ->", status, "(须重新计算)")
     assert status == 409
+
+    print()
+    print("=" * 70)
+    print("场景 4：问卷质控（按版本号核查部分答卷的空白题）")
+    print("=" * 70)
+    # 质控要求受访者编号在该版样本中：恢复含 P1–P8 的样本
+    call("PUT", "/samples", samples)
+    version = call("GET", "/health")[1]["epoch"]
+    questions = json.loads((HERE / "qc_questions.json").read_text())["questions"]
+    sheets = json.loads((HERE / "qc_sheets.json").read_text())["sheets"]
+    status, report = call("POST", "/qc/questionnaire", {
+        "version_id": version, "questions": questions, "sheets": sheets,
+    })
+    print("POST /qc/questionnaire ->", status)
+    assert status == 200
+    print("汇总:", report["summary"])
+    for sheet in report["sheets"]:
+        print(f"  {sheet['respondent_id']}: {sheet['status_label']}"
+              f"（空白 {sheet['blank_count']} 题）")
+        for f in sheet["findings"]:
+            print(f"    #{f['position']} {f['question_id']}: {f['label']}")
+    by_rid = {s["respondent_id"]: s for s in report["sheets"]}
+    assert by_rid["P1"]["status"] == "ok"
+    assert {(f["question_id"], f["classification"])
+            for f in by_rid["P1"]["findings"]} == {
+                ("q3", "should_skip"), ("q4", "missing"),
+                ("q5", "needs_review")}
+    # q1=否 -> q3 必跳过，却录了答案：该答卷矛盾，其余答卷仍照常核查
+    assert by_rid["P4"]["status"] == "contradiction"
+    assert by_rid["P4"]["findings"] == []
+    assert by_rid["P5"]["status"] == "ok"
+
+    # 版本过期 -> 整批 409
+    status, body = call("POST", "/qc/questionnaire", {
+        "version_id": version - 1, "questions": questions, "sheets": sheets,
+    })
+    print("过期版本 POST /qc/questionnaire ->", status)
+    assert status == 409
+    assert body["current_version_id"] == version
 
     print("\n全部演示断言通过 ✔")
 

@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .qc import MAX_QUESTIONS
+
 MAX_SAMPLES = 200
 MAX_TARGETS = 12
 MAX_D = 100
@@ -100,6 +102,145 @@ class WeightItem(BaseModel):
     w: float
     lower: float
     upper: float
+
+
+# ---------------------------------------------------------------- 问卷质控
+def _strict_bool(name: str):
+    def _v(value):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} 必须是布尔值 true/false")
+        return value
+    return field_validator(name, mode="before")(_v)
+
+
+class TriggerConditionIn(StrictModel):
+    question_id: str = Field(description="所引用的前题编号（必须出现在更早的位置）")
+    answer: bool = Field(description="前题须给出的答案：true=是，false=否")
+
+    _v_qid = _strict_code("question_id")
+    _v_answer = _strict_bool("answer")
+
+
+class QuestionIn(StrictModel):
+    question_id: str = Field(description="题目编号，整份问卷内唯一")
+    trigger: list[list[TriggerConditionIn]] | None = Field(
+        default=None,
+        description=(
+            "null 表示无条件询问；否则为触发组列表。任一组条件全部满足即询问，"
+            "组间“或”、组内“与”；被跳过的前题没有答案，不能触发后题。"
+        ),
+    )
+
+    _v_qid = _strict_code("question_id")
+
+    @field_validator("trigger")
+    @classmethod
+    def _check_trigger(cls, v):
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("trigger 须为 null 或至少包含一组条件")
+        for group in v:
+            if len(group) == 0:
+                raise ValueError("触发组不能为空")
+        return v
+
+
+class SheetIn(StrictModel):
+    respondent_id: str = Field(description="受访者编号，须在该版样本中存在且不重复")
+    answers: dict[str, bool] = Field(
+        default_factory=dict,
+        description="已录答案：question_id -> true/false；未出现的题视为空白",
+    )
+
+    _v_rid = _strict_code("respondent_id")
+
+    @field_validator("answers", mode="before")
+    @classmethod
+    def _check_answers(cls, v):
+        # mode="before"：Pydantic 会把 1/0 强转成 bool，必须在强转前拦截，
+        # 否则整数/字符串会冒充“是/否”。
+        if not isinstance(v, dict):
+            raise ValueError("answers 必须是 question_id -> true/false 的对象")
+        out: dict[str, bool] = {}
+        for qid, answer in v.items():
+            if isinstance(qid, bool) or not isinstance(qid, str) or not qid.strip():
+                raise ValueError("answers 的题号必须是非空字符串")
+            key = qid.strip()
+            if key in out:
+                raise ValueError(f"answers 中的题号重复: {key}")
+            if not isinstance(answer, bool):
+                raise ValueError(f"题目 {key} 的答案必须是布尔值 true/false")
+            out[key] = answer
+        return out
+
+
+class QuestionnaireQCPayload(StrictModel):
+    version_id: int = Field(description="调用方认定的输入版本号（epoch），须为当前版本")
+    questions: list[QuestionIn] = Field(
+        description=f"按询问顺序排列的是非题，1–{MAX_QUESTIONS} 道"
+    )
+    sheets: list[SheetIn] = Field(description="部分答卷，按受访者编号提交")
+
+    _v_version = _strict_int("version_id", 1)
+
+    @field_validator("questions")
+    @classmethod
+    def _check_questions(cls, v: list[QuestionIn]):
+        if len(v) > MAX_QUESTIONS:
+            raise ValueError(f"题目至多 {MAX_QUESTIONS} 道")
+        ids = [q.question_id for q in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("question_id 在整份问卷中不得重复")
+        earlier: set[str] = set()
+        for q in v:
+            for group in (q.trigger or []):
+                for cond in group:
+                    if cond.question_id not in earlier:
+                        raise ValueError(
+                            f"题目 {q.question_id} 的条件引用了不存在或并非更早的题: "
+                            f"{cond.question_id}"
+                        )
+            earlier.add(q.question_id)
+        return v
+
+    @field_validator("sheets")
+    @classmethod
+    def _check_sheets(cls, v: list[SheetIn]):
+        ids = [s.respondent_id for s in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("respondent_id 在本次提交中存在重复")
+        return v
+
+
+class FindingOut(BaseModel):
+    question_id: str
+    position: int
+    classification: str
+    label: str
+
+
+class SheetQCResult(BaseModel):
+    respondent_id: str
+    status: str
+    status_label: str
+    blank_count: int
+    findings: list[FindingOut]
+
+
+class QCSummary(BaseModel):
+    sheets: int
+    ok: int
+    contradiction: int
+    missing: int
+    should_skip: int
+    needs_review: int
+
+
+class QCResponse(BaseModel):
+    version_id: int
+    summary: QCSummary
+    sheets: list[SheetQCResult]
 
 
 class TargetTotalsItem(BaseModel):
